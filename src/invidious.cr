@@ -28,6 +28,12 @@ require "zip"
 require "./invidious/helpers/*"
 require "./invidious/*"
 
+macro for(expr)
+  {{expr.args.first.args.first}}.each do |{{expr.name.id}}|
+    {{expr.args.first.block.body}}
+  end
+end
+
 CONFIG   = Config.from_yaml(File.read("config/config.yml"))
 HMAC_KEY = CONFIG.hmac_key || Random::Secure.hex(32)
 
@@ -288,30 +294,31 @@ before_all do |env|
 end
 
 get "/" do |env|
-  locale = LOCALES[env.get("preferences").as(Preferences).locale]?
-  user = env.get? "user"
+  "hello"
+  # locale = LOCALES[env.get("preferences").as(Preferences).locale]?
+  # user = env.get? "user"
 
-  if user
-    user = user.as(User)
-    if user.preferences.redirect_feed
-      next env.redirect "/feed/subscriptions"
-    end
-  end
+  # if user
+  #   user = user.as(User)
+  #   if user.preferences.redirect_feed
+  #     next env.redirect "/feed/subscriptions"
+  #   end
+  # end
 
-  case config.default_home
-  when "Popular"
-    templated "popular"
-  when "Top"
-    templated "top"
-  when "Trending"
-    env.redirect "/feed/trending"
-  when "Subscriptions"
-    if user
-      env.redirect "/feed/subscriptions"
-    else
-      templated "popular"
-    end
-  end
+  # case config.default_home
+  # when "Popular"
+  #   templated "popular"
+  # when "Top"
+  #   templated "top"
+  # when "Trending"
+  #   env.redirect "/feed/trending"
+  # when "Subscriptions"
+  #   if user
+  #     env.redirect "/feed/subscriptions"
+  #   else
+  #     templated "popular"
+  #   end
+  # end
 end
 
 get "/privacy" do |env|
@@ -3461,9 +3468,9 @@ get "/api/v1/trending" do |env|
     json.array do
       trending.each do |video|
         video.to_json(locale, config, Kemal.config, json)
-          end
-        end
       end
+    end
+  end
 
   videos
 end
@@ -3735,11 +3742,11 @@ end
       json.array do
         videos.each do |video|
           video.to_json(locale, config, Kemal.config, json)
-            end
-            end
-          end
         end
       end
+    end
+  end
+end
 
 {"/api/v1/channels/:ucid/latest", "/api/v1/channels/latest/:ucid"}.each do |route|
   get route do |env|
@@ -3761,11 +3768,11 @@ end
       json.array do
         videos.each do |video|
           video.to_json(locale, config, Kemal.config, json)
-            end
-          end
         end
       end
     end
+  end
+end
 
 {"/api/v1/channels/:ucid/playlists", "/api/v1/channels/playlists/:ucid"}.each do |route|
   get route do |env|
@@ -3946,11 +3953,11 @@ get "/api/v1/playlists/:plid" do |env|
         json.array do
           videos.each do |video|
             video.to_json(locale, config, Kemal.config, json)
-            end
           end
         end
       end
     end
+  end
 
   if format == "html"
     response = JSON.parse(response)
@@ -4463,6 +4470,55 @@ end
 
 # YouTube /videoplayback links expire after 6 hours,
 # so we have a mechanism here to redirect to the latest version
+
+get "/latest_version_api" do |env|
+  id = env.params.query["id"]?
+  itag = env.params.query["itag"]?
+  region = env.params.query["region"]?
+
+  local = env.params.query["local"]?
+  local ||= "false"
+  local = local == "true"
+
+  if !id
+    env.response.status_code = 400
+    next
+  end
+
+  video = get_video(id, PG_DB, proxies, region: region)
+
+  # puts video.to_json
+
+  fmt_stream = video.fmt_stream(decrypt_function)
+  adaptive_fmts = video.adaptive_fmts(decrypt_function)
+
+  urls = (fmt_stream + adaptive_fmts)
+
+  res_hash = Hash(String, String | Int32).new
+  res_hash["duration"] = video.info["length_seconds"].to_i
+  for i in urls do
+    if i["type"].includes?("video/mp4")
+      if i["itag"] == "18"
+        res_hash["link"] = i["url"]
+      end
+      if i["itag"] == "136"
+        res_hash["video_only"] = i["url"]
+      end
+      if i["itag"] == "137"
+        res_hash["video_only"] = i["url"]
+      end
+    end
+
+    if i["type"].includes?("audio/mp4")
+      if i["itag"] == "140"
+        res_hash["audio_only"] = i["url"]
+      end
+    end
+  end
+  env.response.content_type = "application/json"
+  res_hash.to_json
+end
+
 get "/latest_version" do |env|
   if env.params.query["download_widget"]?
     download_widget = JSON.parse(env.params.query["download_widget"])
