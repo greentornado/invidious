@@ -22,6 +22,7 @@ class RedditComment
     replies:     RedditThing | String,
     score:       Int32,
     depth:       Int32,
+    permalink:   String,
     created_utc: {
       type:      Time,
       converter: RedditComment::TimeConverter,
@@ -56,14 +57,14 @@ class RedditListing
   })
 end
 
-def fetch_youtube_comments(id, db, continuation, proxies, format, locale, thin_mode, region, sort_by = "top")
-  video = get_video(id, db, proxies, region: region)
+def fetch_youtube_comments(id, db, continuation, format, locale, thin_mode, region, sort_by = "top")
+  video = get_video(id, db, region: region)
   session_token = video.info["session_token"]?
 
   ctoken = produce_comment_continuation(id, cursor: "", sort_by: sort_by)
   continuation ||= ctoken
 
-  if !continuation || !session_token
+  if !continuation || continuation.empty? || !session_token
     if format == "json"
       return {"comments" => [] of String}.to_json
     else
@@ -75,7 +76,7 @@ def fetch_youtube_comments(id, db, continuation, proxies, format, locale, thin_m
     session_token: session_token,
   }
 
-  client = make_client(YT_URL, proxies, video.info["region"]?)
+  client = make_client(YT_URL, video.info["region"]?)
   headers = HTTP::Headers.new
 
   headers["content-type"] = "application/x-www-form-urlencoded"
@@ -177,8 +178,10 @@ def fetch_youtube_comments(id, db, continuation, proxies, format, locale, thin_m
 
               json.field "content", html_to_content(content_html)
               json.field "contentHtml", content_html
+
               json.field "published", published.to_unix
               json.field "publishedText", translate(locale, "`x` ago", recode_date(published, locale))
+
               json.field "likeCount", node_comment["likeCount"]
               json.field "commentId", node_comment["commentId"]
               json.field "authorIsChannelOwner", node_comment["authorIsChannelOwner"]
@@ -273,56 +276,55 @@ def fetch_reddit_comments(id, sort_by = "confidence")
 end
 
 def template_youtube_comments(comments, locale, thin_mode)
-  html = ""
-
-  root = comments["comments"].as_a
-  root.each do |child|
-    if child["replies"]?
-      replies_html = <<-END_HTML
-      <div id="replies" class="pure-g">
-        <div class="pure-u-1-24"></div>
-        <div class="pure-u-23-24">
-          <p>
-            <a href="javascript:void(0)" data-continuation="#{child["replies"]["continuation"]}"
-              onclick="get_youtube_replies(this)">#{translate(locale, "View `x` replies", child["replies"]["replyCount"].to_s)}</a>
-          </p>
+  String.build do |html|
+    root = comments["comments"].as_a
+    root.each do |child|
+      if child["replies"]?
+        replies_html = <<-END_HTML
+        <div id="replies" class="pure-g">
+          <div class="pure-u-1-24"></div>
+          <div class="pure-u-23-24">
+            <p>
+              <a href="javascript:void(0)" data-continuation="#{child["replies"]["continuation"]}"
+                onclick="get_youtube_replies(this)">#{translate(locale, "View `x` replies", child["replies"]["replyCount"].to_s)}</a>
+            </p>
+          </div>
         </div>
-      </div>
-      END_HTML
-    end
-
-    if !thin_mode
-      author_thumbnail = "/ggpht#{URI.parse(child["authorThumbnails"][-1]["url"].as_s).full_path}"
-    else
-      author_thumbnail = ""
-    end
-
-    html += <<-END_HTML
-    <div class="pure-g">
-      <div class="pure-u-4-24 pure-u-md-2-24">
-        <img style="width:90%;padding-right:1em;padding-top:1em" src="#{author_thumbnail}">
-      </div>
-      <div class="pure-u-20-24 pure-u-md-22-24">
-        <p>
-          <b>
-            <a class="#{child["authorIsChannelOwner"] == true ? "channel-owner" : ""}" href="#{child["authorUrl"]}">#{child["author"]}</a>
-          </b>
-          <p style="white-space:pre-wrap">#{child["contentHtml"]}</p>
-          <span title="#{Time.unix(child["published"].as_i64).to_s(translate(locale, "%A %B %-d, %Y"))}">#{translate(locale, "`x` ago", recode_date(Time.unix(child["published"].as_i64), locale))} #{child["isEdited"] == true ? translate(locale, "(edited)") : ""}</span>
-          |
-          <a href="https://www.youtube.com/watch?v=#{comments["videoId"]}&lc=#{child["commentId"]}" title="#{translate(locale, "YouTube comment permalink")}">[YT]</a>
-          |
-          <i class="icon ion-ios-thumbs-up"></i> #{number_with_separator(child["likeCount"])}
-    END_HTML
-
-    if child["creatorHeart"]?
-      if !thin_mode
-        creator_thumbnail = "/ggpht#{URI.parse(child["creatorHeart"]["creatorThumbnail"].as_s).full_path}"
-      else
-        creator_thumbnail = ""
+        END_HTML
       end
 
-      html += <<-END_HTML
+      if !thin_mode
+        author_thumbnail = "/ggpht#{URI.parse(child["authorThumbnails"][-1]["url"].as_s).full_path}"
+      else
+        author_thumbnail = ""
+      end
+
+      html << <<-END_HTML
+      <div class="pure-g">
+        <div class="channel-profile pure-u-4-24 pure-u-md-2-24">
+          <img style="padding-right:1em;padding-top:1em" src="#{author_thumbnail}">
+        </div>
+        <div class="pure-u-20-24 pure-u-md-22-24">
+          <p>
+            <b>
+              <a class="#{child["authorIsChannelOwner"] == true ? "channel-owner" : ""}" href="#{child["authorUrl"]}">#{child["author"]}</a>
+            </b>
+            <p style="white-space:pre-wrap">#{child["contentHtml"]}</p>
+            <span title="#{Time.unix(child["published"].as_i64).to_s(translate(locale, "%A %B %-d, %Y"))}">#{translate(locale, "`x` ago", recode_date(Time.unix(child["published"].as_i64), locale))} #{child["isEdited"] == true ? translate(locale, "(edited)") : ""}</span>
+            |
+            <a href="https://www.youtube.com/watch?v=#{comments["videoId"]}&lc=#{child["commentId"]}" title="#{translate(locale, "YouTube comment permalink")}">[YT]</a>
+            |
+            <i class="icon ion-ios-thumbs-up"></i> #{number_with_separator(child["likeCount"])}
+      END_HTML
+
+      if child["creatorHeart"]?
+        if !thin_mode
+          creator_thumbnail = "/ggpht#{URI.parse(child["creatorHeart"]["creatorThumbnail"].as_s).full_path}"
+        else
+          creator_thumbnail = ""
+        end
+
+        html << <<-END_HTML
           <span class="creator-heart-container" title="#{translate(locale, "`x` marked it with a ❤", child["creatorHeart"]["creatorName"].as_s)}">
               <div class="creator-heart">
                   <img class="creator-heart-background-hearted" src="#{creator_thumbnail}"></img>
@@ -331,84 +333,77 @@ def template_youtube_comments(comments, locale, thin_mode)
                   </div>
               </div>
           </span>
+        END_HTML
+      end
+
+      html << <<-END_HTML
+          </p>
+          #{replies_html}
+        </div>
+      </div>
       END_HTML
     end
 
-    html += <<-END_HTML
-        </p>
-        #{replies_html}
+    if comments["continuation"]?
+      html << <<-END_HTML
+      <div class="pure-g">
+        <div class="pure-u-1">
+          <p>
+            <a href="javascript:void(0)" data-continuation="#{comments["continuation"]}"
+              onclick="get_youtube_replies(this, true)">#{translate(locale, "Load more")}</a>
+          </p>
+        </div>
       </div>
-    </div>
-    END_HTML
+      END_HTML
+    end
   end
-
-  if comments["continuation"]?
-    html += <<-END_HTML
-    <div class="pure-g">
-      <div class="pure-u-1">
-        <p>
-          <a href="javascript:void(0)" data-continuation="#{comments["continuation"]}"
-            onclick="get_youtube_replies(this, true)">#{translate(locale, "Load more")}</a>
-        </p>
-      </div>
-    </div>
-    END_HTML
-  end
-
-  return html
 end
 
 def template_reddit_comments(root, locale)
-  html = ""
-  root.each do |child|
-    if child.data.is_a?(RedditComment)
-      child = child.data.as(RedditComment)
-      author = child.author
-      score = child.score
-      body_html = HTML.unescape(child.body_html)
+  String.build do |html|
+    root.each do |child|
+      if child.data.is_a?(RedditComment)
+        child = child.data.as(RedditComment)
+        body_html = HTML.unescape(child.body_html)
 
-      replies_html = ""
-      if child.replies.is_a?(RedditThing)
-        replies = child.replies.as(RedditThing)
-        replies_html = template_reddit_comments(replies.data.as(RedditListing).children, locale)
-      end
+        replies_html = ""
+        if child.replies.is_a?(RedditThing)
+          replies = child.replies.as(RedditThing)
+          replies_html = template_reddit_comments(replies.data.as(RedditListing).children, locale)
+        end
 
-      content = <<-END_HTML
-      <p>
-        <a href="javascript:void(0)" onclick="toggle_parent(this)">[ - ]</a>
-        <b><a href="https://www.reddit.com/user/#{author}">#{author}</a></b>
-        #{translate(locale, "`x` points", number_with_separator(score))}
-        #{translate(locale, "`x` ago", recode_date(child.created_utc, locale))}
-      </p>
-      <div>
-      #{body_html}
-      #{replies_html}
-      </div>
-      END_HTML
-
-      if child.depth > 0
-        html += <<-END_HTML
+        if child.depth > 0
+          html << <<-END_HTML
           <div class="pure-g">
           <div class="pure-u-1-24">
           </div>
           <div class="pure-u-23-24">
-          #{content}
-          </div>
-          </div>
-        END_HTML
-      else
-        html += <<-END_HTML
+          END_HTML
+        else
+          html << <<-END_HTML
           <div class="pure-g">
           <div class="pure-u-1">
-          #{content}
-          </div>
-          </div>
+          END_HTML
+        end
+
+        html << <<-END_HTML
+        <p>
+          <a href="javascript:void(0)" onclick="toggle_parent(this)">[ - ]</a>
+          <b><a href="https://www.reddit.com/user/#{child.author}">#{child.author}</a></b>
+          #{translate(locale, "`x` points", number_with_separator(child.score))}
+          <span title="#{child.created_utc.to_s(translate(locale, "%a %B %-d %T %Y UTC"))}">#{translate(locale, "`x` ago", recode_date(child.created_utc, locale))}</span>
+          <a href="https://www.reddit.com#{child.permalink}" title="#{translate(locale, "permalink")}">#{translate(locale, "permalink")}</a>
+          </p>
+          <div>
+          #{body_html}
+          #{replies_html}
+        </div>
+        </div>
+        </div>
         END_HTML
       end
     end
   end
-
-  return html
 end
 
 def replace_links(html)
@@ -508,7 +503,7 @@ def content_to_comment_html(content)
     end
 
     text
-  end.join.rchop('\ufeff')
+  end.join("").delete('\ufeff')
 
   return comment_html
 end
