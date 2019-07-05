@@ -4511,7 +4511,7 @@ get "/latest_version_api" do |env|
     next
   end
 
-  video = get_video(id, PG_DB, proxies, region: region)
+  video = get_video(id, PG_DB, region: region)
 
   # puts video.to_json
 
