@@ -123,6 +123,7 @@ struct AboutChannel
     is_family_friendly: Bool,
     allowed_regions:    Array(String),
     related_channels:   Array(AboutRelatedChannel),
+    tabs:               Array(String),
   })
 end
 
@@ -374,13 +375,14 @@ def fetch_channel_playlists(ucid, author, auto_generated, continuation, sort_by)
     json = JSON.parse(response.body)
 
     if json["load_more_widget_html"].as_s.empty?
-      return [] of SearchItem, nil
-    end
+      continuation = nil
+    else
+      continuation = XML.parse_html(json["load_more_widget_html"].as_s)
+      continuation = continuation.xpath_node(%q(//button[@data-uix-load-more-href]))
 
-    continuation = XML.parse_html(json["load_more_widget_html"].as_s)
-    continuation = continuation.xpath_node(%q(//button[@data-uix-load-more-href]))
-    if continuation
-      continuation = extract_channel_playlists_cursor(continuation["data-uix-load-more-href"], auto_generated)
+      if continuation
+        continuation = extract_channel_playlists_cursor(continuation["data-uix-load-more-href"], auto_generated)
+      end
     end
 
     html = XML.parse_html(json["content_html"].as_s)
@@ -439,53 +441,57 @@ def produce_channel_videos_url(ucid, page = 1, auto_generated = nil, sort_by = "
     switch = 0x00
   end
 
-  meta = IO::Memory.new
-  meta.write(Bytes[0x12, 0x06])
-  meta.print("videos")
+  data = IO::Memory.new
+  data.write_byte 0x12
+  data.write_byte 0x06
+  data.print "videos"
 
-  meta.write(Bytes[0x30, 0x02])
-  meta.write(Bytes[0x38, 0x01])
-  meta.write(Bytes[0x60, 0x01])
-  meta.write(Bytes[0x6a, 0x00])
-  meta.write(Bytes[0xb8, 0x01, 0x00])
+  data.write Bytes[0x30, 0x02]
+  data.write Bytes[0x38, 0x01]
+  data.write Bytes[0x60, 0x01]
+  data.write Bytes[0x6a, 0x00]
+  data.write Bytes[0xb8, 0x01, 0x00]
 
-  meta.write(Bytes[0x20, switch])
-  meta.write(Bytes[0x7a, page.size])
-  meta.print(page)
+  data.write Bytes[0x20, switch]
+  data.write_byte 0x7a
+  VarInt.to_io(data, page.bytesize)
+  data.print page
 
   case sort_by
   when "newest"
     # Empty tags can be omitted
     # meta.write(Bytes[0x18,0x00])
   when "popular"
-    meta.write(Bytes[0x18, 0x01])
+    data.write Bytes[0x18, 0x01]
   when "oldest"
-    meta.write(Bytes[0x18, 0x02])
+    data.write Bytes[0x18, 0x02]
   end
 
-  meta.rewind
-  meta = Base64.urlsafe_encode(meta.to_slice)
-  meta = URI.escape(meta)
+  data = Base64.urlsafe_encode(data)
+  cursor = URI.escape(data)
 
-  continuation = IO::Memory.new
-  continuation.write(Bytes[0x12, ucid.size])
-  continuation.print(ucid)
+  data = IO::Memory.new
 
-  continuation.write(Bytes[0x1a, meta.size])
-  continuation.print(meta)
+  data.write_byte 0x12
+  VarInt.to_io(data, ucid.bytesize)
+  data.print ucid
 
-  continuation.rewind
-  continuation = continuation.gets_to_end
+  data.write_byte 0x1a
+  VarInt.to_io(data, cursor.bytesize)
+  data.print cursor
 
-  wrapper = IO::Memory.new
-  wrapper.write(Bytes[0xe2, 0xa9, 0x85, 0xb2, 0x02, continuation.size])
-  wrapper.print(continuation)
-  wrapper.rewind
+  data.rewind
 
-  wrapper = Base64.urlsafe_encode(wrapper.to_slice)
-  wrapper = URI.escape(wrapper)
+  buffer = IO::Memory.new
+  buffer.write Bytes[0xe2, 0xa9, 0x85, 0xb2, 0x02]
+  VarInt.to_io(buffer, data.bytesize)
 
-  url = "/browse_ajax?continuation=#{wrapper}&gl=US&hl=en"
+  IO.copy data, buffer
+
+  continuation = Base64.urlsafe_encode(buffer)
+  continuation = URI.escape(continuation)
+
+  url = "/browse_ajax?continuation=#{continuation}&gl=US&hl=en"
 
   return url
 end
@@ -495,117 +501,108 @@ def produce_channel_playlists_url(ucid, cursor, sort = "newest", auto_generated 
     cursor = Base64.urlsafe_encode(cursor, false)
   end
 
-  meta = IO::Memory.new
+  data = IO::Memory.new
 
   if auto_generated
-    meta.write(Bytes[0x08, 0x0a])
+    data.write Bytes[0x08, 0x0a]
   end
 
-  meta.write(Bytes[0x12, 0x09])
-  meta.print("playlists")
+  data.write Bytes[0x12, 0x09]
+  data.print "playlists"
 
   if auto_generated
-    meta.write(Bytes[0x20, 0x32])
+    data.write Bytes[0x20, 0x32]
   else
     # TODO: Look at 0x01, 0x00
     case sort
     when "oldest", "oldest_created"
-      meta.write(Bytes[0x18, 0x02])
+      data.write Bytes[0x18, 0x02]
     when "newest", "newest_created"
-      meta.write(Bytes[0x18, 0x03])
+      data.write Bytes[0x18, 0x03]
     when "last", "last_added"
-      meta.write(Bytes[0x18, 0x04])
+      data.write Bytes[0x18, 0x04]
     end
 
-    meta.write(Bytes[0x20, 0x01])
+    data.write Bytes[0x20, 0x01]
   end
 
-  meta.write(Bytes[0x30, 0x02])
-  meta.write(Bytes[0x38, 0x01])
-  meta.write(Bytes[0x60, 0x01])
-  meta.write(Bytes[0x6a, 0x00])
+  data.write Bytes[0x30, 0x02]
+  data.write Bytes[0x38, 0x01]
+  data.write Bytes[0x60, 0x01]
+  data.write Bytes[0x6a, 0x00]
 
-  meta.write(Bytes[0x7a, cursor.size])
-  meta.print(cursor)
+  data.write_byte 0x7a
+  VarInt.to_io(data, cursor.bytesize)
+  data.print cursor
 
-  meta.write(Bytes[0xb8, 0x01, 0x00])
+  data.write Bytes[0xb8, 0x01, 0x00]
 
-  meta.rewind
-  meta = Base64.urlsafe_encode(meta.to_slice)
-  meta = URI.escape(meta)
+  data.rewind
+  data = Base64.urlsafe_encode(data)
+  continuation = URI.escape(data)
 
-  continuation = IO::Memory.new
-  continuation.write(Bytes[0x12, ucid.size])
-  continuation.print(ucid)
+  data = IO::Memory.new
 
-  continuation.write(Bytes[0x1a])
-  continuation.write(write_var_int(meta.size))
-  continuation.print(meta)
+  data.write_byte 0x12
+  VarInt.to_io(data, ucid.bytesize)
+  data.print ucid
 
-  continuation.rewind
-  continuation = continuation.gets_to_end
+  data.write_byte 0x1a
+  VarInt.to_io(data, continuation.bytesize)
+  data.print continuation
 
-  wrapper = IO::Memory.new
-  wrapper.write(Bytes[0xe2, 0xa9, 0x85, 0xb2, 0x02])
-  wrapper.write(write_var_int(continuation.size))
-  wrapper.print(continuation)
-  wrapper.rewind
+  data.rewind
 
-  wrapper = Base64.urlsafe_encode(wrapper.to_slice)
-  wrapper = URI.escape(wrapper)
+  buffer = IO::Memory.new
+  buffer.write Bytes[0xe2, 0xa9, 0x85, 0xb2, 0x02]
+  VarInt.to_io(buffer, data.bytesize)
 
-  url = "/browse_ajax?continuation=#{wrapper}&gl=US&hl=en"
+  IO.copy data, buffer
+
+  continuation = Base64.urlsafe_encode(buffer)
+  continuation = URI.escape(continuation)
+
+  url = "/browse_ajax?continuation=#{continuation}&gl=US&hl=en"
 
   return url
 end
 
 def extract_channel_playlists_cursor(url, auto_generated)
-  wrapper = HTTP::Params.parse(URI.parse(url).query.not_nil!)["continuation"]
+  continuation = HTTP::Params.parse(URI.parse(url).query.not_nil!)["continuation"]
 
-  wrapper = URI.unescape(wrapper)
-  wrapper = Base64.decode(wrapper)
+  continuation = URI.unescape(continuation)
+  data = IO::Memory.new(Base64.decode(continuation))
 
   # 0xe2 0xa9 0x85 0xb2 0x02
-  wrapper += 5
+  data.pos += 5
 
-  continuation_size = read_var_int(wrapper[0, 4])
-  wrapper += write_var_int(continuation_size).size
-  continuation = wrapper[0, continuation_size]
+  continuation = Bytes.new(data.read_bytes(VarInt))
+  data.read continuation
+  data = IO::Memory.new(continuation)
 
-  # 0x12
-  continuation += 1
-  ucid_size = continuation[0]
-  continuation += 1
-  ucid = continuation[0, ucid_size]
-  continuation += ucid_size
+  data.read_byte # => 0x12
+  ucid = Bytes.new(data.read_bytes(VarInt))
+  data.read ucid
 
-  # 0x1a
-  continuation += 1
-  meta_size = read_var_int(continuation[0, 4])
-  continuation += write_var_int(meta_size).size
-  meta = continuation[0, meta_size]
-  continuation += meta_size
+  data.read_byte # => 0x1a
+  inner_continuation = Bytes.new(data.read_bytes(VarInt))
+  data.read inner_continuation
 
-  meta = String.new(meta)
-  meta = URI.unescape(meta)
-  meta = Base64.decode(meta)
+  continuation = String.new(inner_continuation)
+  continuation = URI.unescape(continuation)
+  data = IO::Memory.new(Base64.decode(continuation))
 
   # 0x12 0x09 playlists
-  meta += 11
+  data.pos += 11
 
-  until meta[0] == 0x7a
-    tag = read_var_int(meta[0, 4])
-    meta += write_var_int(tag).size
-    value = meta[0]
-    meta += 1
+  until data.peek[0] == 0x7a
+    key = data.read_bytes(VarInt)
+    value = data.read_bytes(VarInt)
   end
 
-  # 0x7a
-  meta += 1
-  cursor_size = meta[0]
-  meta += 1
-  cursor = meta[0, cursor_size]
-
+  data.pos += 1 # => 0x7a
+  cursor = Bytes.new(data.read_bytes(VarInt))
+  data.read cursor
   cursor = String.new(cursor)
 
   if !auto_generated
@@ -617,7 +614,7 @@ def extract_channel_playlists_cursor(url, auto_generated)
 end
 
 # TODO: Add "sort_by"
-def fetch_channel_community(ucid, continuation, locale, config, kemal_config)
+def fetch_channel_community(ucid, continuation, locale, config, kemal_config, format, thin_mode)
   client = make_client(YT_URL)
   headers = HTTP::Headers.new
   headers["User-Agent"] = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36"
@@ -632,12 +629,11 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config)
     raise error_message
   end
 
+  ucid = response.body.match(/https:\/\/www.youtube.com\/channel\/(?<ucid>UC[a-zA-Z0-9_-]{22})/).not_nil!["ucid"]
+
   if !continuation || continuation.empty?
-    response = JSON.parse(response.body.match(/window\["ytInitialData"\] = (?<info>.*?);\n/).try &.["info"] || "{}")
-    ucid = response["responseContext"]["serviceTrackingParams"]
-      .as_a.select { |service| service["service"] == "GFEEDBACK" }[0]?.try &.["params"]
-        .as_a.select { |param| param["key"] == "browse_id" }[0]?.try &.["value"].as_s
-    body = response["contents"]?.try &.["twoColumnBrowseResultsRenderer"]["tabs"].as_a.select { |tab| tab["tabRenderer"]?.try &.["selected"].as_bool.== true }[0]?
+    initial_data = extract_initial_data(response.body)
+    body = initial_data["contents"]?.try &.["twoColumnBrowseResultsRenderer"]["tabs"].as_a.select { |tab| tab["tabRenderer"]?.try &.["selected"].as_bool.== true }[0]?
 
     if !body
       raise "Could not extract community tab."
@@ -645,6 +641,8 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config)
 
     body = body["tabRenderer"]["content"]["sectionListRenderer"]["contents"][0]["itemSectionRenderer"]
   else
+    continuation = produce_channel_community_continuation(ucid, continuation)
+
     headers["cookie"] = response.cookies.add_request_headers(headers)["cookie"]
     headers["content-type"] = "application/x-www-form-urlencoded"
 
@@ -662,10 +660,6 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config)
 
     response = client.post("/comment_service_ajax?action_get_comments=1&ctoken=#{continuation}&continuation=#{continuation}&hl=en&gl=US", headers, form: post_req)
     body = JSON.parse(response.body)
-
-    ucid = body["response"]["responseContext"]["serviceTrackingParams"]
-      .as_a.select { |service| service["service"] == "GFEEDBACK" }[0]?.try &.["params"]
-        .as_a.select { |param| param["key"] == "browse_id" }[0]?.try &.["value"].as_s
 
     body = body["response"]["continuationContents"]["itemSectionContinuation"]? ||
            body["response"]["continuationContents"]["backstageCommentsContinuation"]?
@@ -685,7 +679,7 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config)
     raise error_message
   end
 
-  JSON.build do |json|
+  response = JSON.build do |json|
     json.object do
       json.field "authorId", ucid
       json.field "comments" do
@@ -755,6 +749,7 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config)
 
               json.field "likeCount", like_count
               json.field "commentId", post["postId"]? || post["commentId"]? || ""
+              json.field "authorIsChannelOwner", post["authorEndpoint"]["browseEndpoint"]["browseId"] == ucid
 
               if attachment = post["backstageAttachment"]?
                 json.field "attachment" do
@@ -821,8 +816,13 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config)
                           end
                         end
                       end
-                    else
                       # TODO
+                      # when .has_key?("pollRenderer")
+                      #   attachment = attachment["pollRenderer"]
+                      #   json.field "type", "poll"
+                    else
+                      json.field "type", "unknown"
+                      json.field "error", "Unrecognized attachment type."
                     end
                   end
                 end
@@ -837,7 +837,7 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config)
                 json.field "replies" do
                   json.object do
                     json.field "replyCount", reply_count
-                    json.field "continuation", continuation
+                    json.field "continuation", extract_channel_community_cursor(continuation)
                   end
                 end
               end
@@ -847,11 +847,74 @@ def fetch_channel_community(ucid, continuation, locale, config, kemal_config)
       end
 
       if body["continuations"]?
-        continuation = body["continuations"][0]["nextContinuationData"]["continuation"]
-        json.field "continuation", continuation
+        continuation = body["continuations"][0]["nextContinuationData"]["continuation"].as_s
+        json.field "continuation", extract_channel_community_cursor(continuation)
       end
     end
   end
+
+  if format == "html"
+    response = JSON.parse(response)
+    content_html = template_youtube_comments(response, locale, thin_mode)
+
+    response = JSON.build do |json|
+      json.object do
+        json.field "contentHtml", content_html
+      end
+    end
+  end
+
+  return response
+end
+
+def produce_channel_community_continuation(ucid, cursor)
+  cursor = URI.escape(cursor)
+
+  data = IO::Memory.new
+
+  data.write_byte 0x12
+  VarInt.to_io(data, ucid.bytesize)
+  data.print ucid
+
+  data.write_byte 0x1a
+  VarInt.to_io(data, cursor.bytesize)
+  data.print cursor
+
+  data.rewind
+
+  buffer = IO::Memory.new
+  buffer.write Bytes[0xe2, 0xa9, 0x85, 0xb2, 0x02]
+  VarInt.to_io(buffer, data.size)
+
+  IO.copy data, buffer
+
+  continuation = Base64.urlsafe_encode(buffer)
+  continuation = URI.escape(continuation)
+
+  return continuation
+end
+
+def extract_channel_community_cursor(continuation)
+  continuation = URI.unescape(continuation)
+  data = IO::Memory.new(Base64.decode(continuation))
+
+  # 0xe2 0xa9 0x85 0xb2 0x02
+  data.pos += 5
+
+  continuation = Bytes.new(data.read_bytes(VarInt))
+  data.read continuation
+  data = IO::Memory.new(continuation)
+
+  data.read_byte # => 0x12
+  ucid = Bytes.new(data.read_bytes(VarInt))
+  data.read ucid
+
+  data.read_byte # => 0x1a
+  until data.peek[0] == 'E'.ord
+    data.read_byte
+  end
+
+  return URI.unescape(data.gets_to_end)
 end
 
 def get_about_info(ucid, locale)
@@ -947,6 +1010,8 @@ def get_about_info(ucid, locale)
     auto_generated = true
   end
 
+  tabs = about.xpath_nodes(%q(//ul[@id="channel-navigation-menu"]/li/a/span)).map { |node| node.content.downcase }
+
   return AboutChannel.new(
     ucid: ucid,
     author: author,
@@ -961,7 +1026,8 @@ def get_about_info(ucid, locale)
     joined: joined,
     is_family_friendly: is_family_friendly,
     allowed_regions: allowed_regions,
-    related_channels: related_channels
+    related_channels: related_channels,
+    tabs: tabs
   )
 end
 
