@@ -4614,6 +4614,7 @@ get "/latest_version_api" do |env|
   id = env.params.query["id"]?
   itag = env.params.query["itag"]?
   region = env.params.query["region"]?
+  region ||= "VN"
 
   local = env.params.query["local"]?
   local ||= "false"
