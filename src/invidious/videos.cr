@@ -258,6 +258,7 @@ struct VideoPreferences
     listen:             Bool,
     local:              Bool,
     preferred_captions: Array(String),
+    player_style:       String,
     quality:            String,
     raw:                Bool,
     region:             String?,
@@ -319,7 +320,7 @@ struct Video
 
           qualities.each do |quality|
             json.object do
-              json.field "url", self.author_thumbnail.gsub("=s48-", "=s#{quality}-")
+              json.field "url", self.author_thumbnail.gsub(/=s\d+/, "=s#{quality}")
               json.field "width", quality
               json.field "height", quality
             end
@@ -329,7 +330,7 @@ struct Video
 
       json.field "subCountText", self.sub_count_text
 
-      json.field "lengthSeconds", self.info["length_seconds"].to_i
+      json.field "lengthSeconds", self.length_seconds
       json.field "allowRatings", self.allow_ratings
       json.field "rating", self.info["avg_rating"].to_f32
       json.field "isListed", self.is_listed
@@ -563,7 +564,14 @@ struct Video
         fmt["clen"] = fmt_stream["contentLength"]?.try &.as_s || "0"
         fmt["bitrate"] = fmt_stream["bitrate"]?.try &.as_i.to_s || "0"
         fmt["itag"] = fmt_stream["itag"].as_i.to_s
-        fmt["url"] = fmt_stream["url"].as_s
+        if fmt_stream["url"]?
+          fmt["url"] = fmt_stream["url"].as_s
+        end
+        if fmt_stream["cipher"]?
+          HTTP::Params.parse(fmt_stream["cipher"].as_s).each do |key, value|
+            fmt[key] = value
+          end
+        end
         fmt["quality"] = fmt_stream["quality"].as_s
 
         if fmt_stream["width"]?
@@ -635,8 +643,14 @@ struct Video
         fmt["clen"] = adaptive_fmt["contentLength"]?.try &.as_s || "0"
         fmt["bitrate"] = adaptive_fmt["bitrate"]?.try &.as_i.to_s || "0"
         fmt["itag"] = adaptive_fmt["itag"].as_i.to_s
-        fmt["url"] = adaptive_fmt["url"].as_s
-
+        if adaptive_fmt["url"]?
+          fmt["url"] = adaptive_fmt["url"].as_s
+        end
+        if adaptive_fmt["cipher"]?
+          HTTP::Params.parse(adaptive_fmt["cipher"].as_s).each do |key, value|
+            fmt[key] = value
+          end
+        end
         if index = adaptive_fmt["indexRange"]?
           fmt["index"] = "#{index["start"]}-#{index["end"]}"
         end
@@ -790,8 +804,11 @@ struct Video
   end
 
   def premium
-    premium = self.player_response.to_s.includes? "Get YouTube without the ads."
-    return premium
+    if info["premium"]?
+      self.info["premium"] == "true"
+    else
+      false
+    end
   end
 
   def captions
@@ -827,7 +844,7 @@ struct Video
   end
 
   def length_seconds
-    return self.info["length_seconds"].to_i
+    self.player_response["videoDetails"]["lengthSeconds"].as_s.to_i
   end
 
   db_mapping({
@@ -1115,35 +1132,20 @@ def fetch_video(id, region)
   info = extract_player_config(response.body, html)
   info["cookie"] = response.cookies.to_h.map { |name, cookie| "#{name}=#{cookie.value}" }.join("; ")
 
-  # Try to use proxies for region-blocked videos
+  allowed_regions = html.xpath_node(%q(//meta[@itemprop="regionsAllowed"])).try &.["content"].split(",")
+  allowed_regions ||= [] of String
+
+  # Check for region-blocks
   if info["reason"]? && info["reason"].includes? "your country"
-    bypass_channel = Channel({XML::Node, HTTP::Params} | Nil).new
+    region = allowed_regions.sample(1)[0]?
+    client = make_client(YT_URL, region)
+    response = client.get("/watch?v=#{id}&gl=US&hl=en&disable_polymer=1&has_verified=1&bpctr=9999999999")
 
-    PROXY_LIST.each do |proxy_region, list|
-      spawn do
-        client = make_client(YT_URL, proxy_region)
-        proxy_response = client.get("/watch?v=#{id}&gl=US&hl=en&disable_polymer=1&has_verified=1&bpctr=9999999999")
+    html = XML.parse_html(response.body)
+    info = extract_player_config(response.body, html)
 
-        proxy_html = XML.parse_html(proxy_response.body)
-        proxy_info = extract_player_config(proxy_response.body, proxy_html)
-
-        if !proxy_info["reason"]?
-          proxy_info["region"] = proxy_region
-          proxy_info["cookie"] = proxy_response.cookies.to_h.map { |name, cookie| "#{name}=#{cookie.value}" }.join("; ")
-          bypass_channel.send({proxy_html, proxy_info})
-        else
-          bypass_channel.send(nil)
-        end
-      end
-    end
-
-    PROXY_LIST.size.times do
-      response = bypass_channel.receive
-      if response
-        html, info = response
-        break
-      end
-    end
+    info["region"] = region if region
+    info["cookie"] = response.cookies.to_h.map { |name, cookie| "#{name}=#{cookie.value}" }.join("; ")
   end
 
   # Try to pull streams from embed URL
@@ -1162,17 +1164,21 @@ def fetch_video(id, region)
     end
   end
 
-  if info["errorcode"]?.try &.== "2"
+  if !info["player_response"]? || info["errorcode"]?.try &.== "2"
     raise "Video unavailable."
   end
 
-  if !info["title"]? || info["title"].empty?
-    raise "Video unavailable."
+  if info["reason"]? && !info["player_response"]["videoDetails"]?
+    raise info["reason"]
   end
 
-  title = info["title"]
-  author = info["author"]? || ""
-  ucid = info["ucid"]? || ""
+  player_json = JSON.parse(info["player_response"])
+
+  title = player_json["videoDetails"]["title"].as_s
+  author = player_json["videoDetails"]["author"]?.try &.as_s || ""
+  ucid = player_json["videoDetails"]["channelId"]?.try &.as_s || ""
+
+  info["premium"] = html.xpath_node(%q(.//span[text()="Premium"])) ? "true" : "false"
 
   views = html.xpath_node(%q(//meta[@itemprop="interactionCount"]))
     .try &.["content"].to_i64? || 0_i64
@@ -1193,9 +1199,6 @@ def fetch_video(id, region)
   published = html.xpath_node(%q(//meta[@itemprop="datePublished"])).try &.["content"]
   published ||= Time.utc.to_s("%Y-%m-%d")
   published = Time.parse(published, "%Y-%m-%d", Time::Location.local)
-
-  allowed_regions = html.xpath_node(%q(//meta[@itemprop="regionsAllowed"])).try &.["content"].split(",")
-  allowed_regions ||= [] of String
 
   is_family_friendly = html.xpath_node(%q(//meta[@itemprop="isFamilyFriendly"])).try &.["content"] == "True"
   is_family_friendly ||= true
@@ -1244,6 +1247,7 @@ def process_video_params(query, preferences)
   continue_autoplay = query["continue_autoplay"]?.try &.to_i?
   listen = query["listen"]? && (query["listen"] == "true" || query["listen"] == "1").to_unsafe
   local = query["local"]? && (query["local"] == "true" || query["local"] == "1").to_unsafe
+  player_style = query["player_style"]?
   preferred_captions = query["subtitles"]?.try &.split(",").map { |a| a.downcase }
   quality = query["quality"]?
   region = query["region"]?
@@ -1261,6 +1265,7 @@ def process_video_params(query, preferences)
     continue_autoplay ||= preferences.continue_autoplay.to_unsafe
     listen ||= preferences.listen.to_unsafe
     local ||= preferences.local.to_unsafe
+    player_style ||= preferences.player_style
     preferred_captions ||= preferences.captions
     quality ||= preferences.quality
     related_videos ||= preferences.related_videos.to_unsafe
@@ -1276,6 +1281,7 @@ def process_video_params(query, preferences)
   continue_autoplay ||= CONFIG.default_user_preferences.continue_autoplay.to_unsafe
   listen ||= CONFIG.default_user_preferences.listen.to_unsafe
   local ||= CONFIG.default_user_preferences.local.to_unsafe
+  player_style ||= CONFIG.default_user_preferences.player_style
   preferred_captions ||= CONFIG.default_user_preferences.captions
   quality ||= CONFIG.default_user_preferences.quality
   related_videos ||= CONFIG.default_user_preferences.related_videos.to_unsafe
@@ -1334,6 +1340,7 @@ def process_video_params(query, preferences)
     controls: controls,
     listen: listen,
     local: local,
+    player_style: player_style,
     preferred_captions: preferred_captions,
     quality: quality,
     raw: raw,

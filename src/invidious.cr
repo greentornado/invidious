@@ -470,8 +470,16 @@ get "/watch" do |env|
 
   # Older videos may not have audio sources available.
   # We redirect here so they're not unplayable
-  if params.listen && audio_streams.empty?
-    next env.redirect "/watch?#{env.params.query}&listen=0"
+  if audio_streams.empty?
+    if params.quality == "dash"
+      env.params.query.delete_all("quality")
+      env.params.query["quality"] = "medium"
+      next env.redirect "/watch?#{env.params.query}"
+    elsif params.listen
+      env.params.query.delete_all("listen")
+      env.params.query["listen"] = "0"
+      next env.redirect "/watch?#{env.params.query}"
+    end
   end
 
   captions = video.captions
@@ -528,7 +536,11 @@ get "/watch" do |env|
   end
 
   rating = video.info["avg_rating"].to_f64
-  engagement = ((video.dislikes.to_f + video.likes.to_f)/video.views * 100)
+  if video.views > 0
+    engagement = ((video.dislikes.to_f + video.likes.to_f)/video.views * 100)
+  else
+    engagement = 0
+  end
 
   playability_status = video.player_response["playabilityStatus"]?
   if playability_status && playability_status["status"] == "LIVE_STREAM_OFFLINE" && !video.premiere_timestamp
@@ -537,6 +549,30 @@ get "/watch" do |env|
   reason ||= ""
 
   templated "watch"
+end
+
+get "/embed/" do |env|
+  locale = LOCALES[env.get("preferences").as(Preferences).locale]?
+
+  if plid = env.params.query["list"]?
+    begin
+      videos = fetch_playlist_videos(plid, 1, 1, locale: locale)
+    rescue ex
+      error_message = ex.message
+      env.response.status_code = 500
+      next templated "error"
+    end
+
+    url = "/embed/#{videos[0].id}?#{env.params.query}"
+
+    if env.params.query.size > 0
+      url += "?#{env.params.query}"
+    end
+  else
+    url = "/"
+  end
+
+  env.redirect url
 end
 
 get "/embed/:id" do |env|
@@ -566,7 +602,8 @@ get "/embed/:id" do |env|
 
   # YouTube embed supports `videoseries` with either `list=PLID`
   # or `playlist=VIDEO_ID,VIDEO_ID`
-  if id == "videoseries"
+  case id
+  when "videoseries"
     url = ""
 
     if plid
@@ -591,7 +628,26 @@ get "/embed/:id" do |env|
     end
 
     next env.redirect url
-  elsif id.size > 11
+  when "live_stream"
+    client = make_client(YT_URL)
+    response = client.get("/embed/live_stream?channel=#{env.params.query["channel"]? || ""}")
+    video_id = response.body.match(/"video_id":"(?<video_id>[a-zA-Z0-9_-]{11})"/).try &.["video_id"]
+
+    env.params.query.delete_all("channel")
+
+    if !video_id || video_id == "live_stream"
+      error_message = "Video is unavailable."
+      next templated "error"
+    end
+
+    url = "/embed/#{video_id}"
+
+    if env.params.query.size > 0
+      url += "?#{env.params.query}"
+    end
+
+    next env.redirect url
+  when id.size > 11
     url = "/embed/#{id[0, 11]}"
 
     if env.params.query.size > 0
@@ -647,6 +703,17 @@ get "/embed/:id" do |env|
 
   video_streams = video.video_streams(adaptive_fmts)
   audio_streams = video.audio_streams(adaptive_fmts)
+
+  if audio_streams.empty?
+    if params.quality == "dash"
+      env.params.query.delete_all("quality")
+      next env.redirect "/embed/#{video_id}?#{env.params.query}"
+    elsif params.listen
+      env.params.query.delete_all("listen")
+      env.params.query["listen"] = "0"
+      next env.redirect "/embed/#{video_id}?#{env.params.query}"
+    end
+  end
 
   captions = video.captions
 
@@ -866,6 +933,7 @@ get "/search" do |env|
     count, videos = search(search_query, page, search_params, region).as(Tuple)
   end
 
+  env.set "search", query
   templated "search"
 end
 
@@ -1436,6 +1504,9 @@ post "/preferences" do |env|
   speed = env.params.body["speed"]?.try &.as(String).to_f32?
   speed ||= CONFIG.default_user_preferences.speed
 
+  player_style = env.params.body["player_style"]?.try &.as(String)
+  player_style ||= CONFIG.default_user_preferences.player_style
+
   quality = env.params.body["quality"]?.try &.as(String)
   quality ||= CONFIG.default_user_preferences.quality
 
@@ -1504,6 +1575,7 @@ post "/preferences" do |env|
     locale:                 locale,
     max_results:            max_results,
     notifications_only:     notifications_only,
+    player_style:           player_style,
     quality:                quality,
     redirect_feed:          redirect_feed,
     related_videos:         related_videos,
@@ -3033,6 +3105,7 @@ get "/channel/:ucid/playlists" do |env|
   items = items.map { |item| item.as(SearchPlaylist) }
   items.each { |item| item.author = "" }
 
+  env.set "search", "channel:#{channel.ucid} "
   templated "playlists"
 end
 
@@ -3073,6 +3146,7 @@ get "/channel/:ucid/community" do |env|
     error_message = ex.message
   end
 
+  env.set "search", "channel:#{channel.ucid} "
   templated "community"
 end
 
@@ -3609,7 +3683,7 @@ get "/api/v1/top" do |env|
             generate_thumbnails(json, video.id, config, Kemal.config)
           end
 
-          json.field "lengthSeconds", video.info["length_seconds"].to_i
+          json.field "lengthSeconds", video.length_seconds
           json.field "viewCount", video.views
 
           json.field "author", video.author
@@ -3695,7 +3769,7 @@ get "/api/v1/channels/:ucid" do |env|
 
           qualities.each do |quality|
             json.object do
-              json.field "url", channel.author_thumbnail.gsub("=s100-", "=s#{quality}-")
+              json.field "url", channel.author_thumbnail.gsub(/=\d+/, "=s#{quality}")
               json.field "width", quality
               json.field "height", quality
             end
@@ -3737,7 +3811,7 @@ get "/api/v1/channels/:ucid" do |env|
 
                   qualities.each do |quality|
                     json.object do
-                      json.field "url", related_channel.author_thumbnail.gsub("=s48-", "=s#{quality}-")
+                      json.field "url", related_channel.author_thumbnail.gsub(/=\d+/, "=s#{quality}")
                       json.field "width", quality
                       json.field "height", quality
                     end
@@ -4035,7 +4109,7 @@ get "/api/v1/playlists/:plid" do |env|
 
           qualities.each do |quality|
             json.object do
-              json.field "url", playlist.author_thumbnail.gsub("=s100-", "=s#{quality}-")
+              json.field "url", playlist.author_thumbnail.gsub(/=\d+/, "=s#{quality}")
               json.field "width", quality
               json.field "height", quality
             end
@@ -4449,12 +4523,12 @@ get "/api/manifest/dash/id/:id" do |env|
   end
 
   audio_streams = video.audio_streams(adaptive_fmts)
-  video_streams = video.video_streams(adaptive_fmts)
+  video_streams = video.video_streams(adaptive_fmts).sort_by { |stream| stream["fps"].to_i }.reverse
 
   XML.build(indent: "  ", encoding: "UTF-8") do |xml|
     xml.element("MPD", "xmlns": "urn:mpeg:dash:schema:mpd:2011",
       "profiles": "urn:mpeg:dash:profile:full:2011", minBufferTime: "PT1.5S", type: "static",
-      mediaPresentationDuration: "PT#{video.info["length_seconds"]}S") do
+      mediaPresentationDuration: "PT#{video.length_seconds}S") do
       xml.element("Period") do
         i = 0
 
