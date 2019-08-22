@@ -273,8 +273,7 @@ before_all do |env|
     end
   end
 
-  dark_mode = env.params.query["dark_mode"]? || preferences.dark_mode.to_s
-  dark_mode = dark_mode == "true"
+  dark_mode = convert_theme(env.params.query["dark_mode"]?) || preferences.dark_mode.to_s
 
   thin_mode = env.params.query["thin_mode"]? || preferences.thin_mode.to_s
   thin_mode = thin_mode == "true"
@@ -1535,8 +1534,7 @@ post "/preferences" do |env|
   locale ||= CONFIG.default_user_preferences.locale
 
   dark_mode = env.params.body["dark_mode"]?.try &.as(String)
-  dark_mode ||= "off"
-  dark_mode = dark_mode == "on"
+  dark_mode ||= CONFIG.default_user_preferences.dark_mode
 
   thin_mode = env.params.body["thin_mode"]?.try &.as(String)
   thin_mode ||= "off"
@@ -1560,6 +1558,7 @@ post "/preferences" do |env|
   notifications_only ||= "off"
   notifications_only = notifications_only == "on"
 
+  # Convert to JSON and back again to take advantage of converters used for compatability
   preferences = Preferences.from_json({
     annotations:            annotations,
     annotations_subscribed: annotations_subscribed,
@@ -1655,12 +1654,27 @@ get "/toggle_theme" do |env|
   if user = env.get? "user"
     user = user.as(User)
     preferences = user.preferences
-    preferences.dark_mode = !preferences.dark_mode
 
-    PG_DB.exec("UPDATE users SET preferences = $1 WHERE email = $2", preferences.to_json, user.email)
+    case preferences.dark_mode
+    when "dark"
+      preferences.dark_mode = "light"
+    else
+      preferences.dark_mode = "dark"
+    end
+
+    preferences = preferences.to_json
+
+    PG_DB.exec("UPDATE users SET preferences = $1 WHERE email = $2", preferences, user.email)
   else
     preferences = env.get("preferences").as(Preferences)
-    preferences.dark_mode = !preferences.dark_mode
+
+    case preferences.dark_mode
+    when "dark"
+      preferences.dark_mode = "light"
+    else
+      preferences.dark_mode = "dark"
+    end
+
     preferences = preferences.to_json
 
     if Kemal.config.ssl || config.https_only
@@ -2033,7 +2047,7 @@ post "/data_control" do |env|
       env.response.puts %(<meta http-equiv="refresh" content="0; url=#{referer}">)
       env.response.puts %(<link rel="stylesheet" href="/css/ionicons.min.css?v=#{ASSET_COMMIT}">)
       env.response.puts %(<link rel="stylesheet" href="/css/default.css?v=#{ASSET_COMMIT}">)
-      if env.get("preferences").as(Preferences).dark_mode
+      if env.get("preferences").as(Preferences).dark_mode == "dark"
         env.response.puts %(<link rel="stylesheet" href="/css/darktheme.css?v=#{ASSET_COMMIT}">)
       else
         env.response.puts %(<link rel="stylesheet" href="/css/lighttheme.css?v=#{ASSET_COMMIT}">)
@@ -2996,7 +3010,7 @@ get "/user/:user/about" do |env|
   env.redirect "/channel/#{user}"
 end
 
-get "/channel:ucid/about" do |env|
+get "/channel/:ucid/about" do |env|
   ucid = env.params.url["ucid"]
   env.redirect "/channel/#{ucid}"
 end
@@ -3040,8 +3054,7 @@ get "/channel/:ucid" do |env|
         item.author
       end
     end
-    items.select! { |item| item.responds_to?(:thumbnail_id) && item.thumbnail_id }
-    items = items.map { |item| item.as(SearchPlaylist) }
+    items = items.select { |item| item.is_a?(SearchPlaylist) }.map { |item| item.as(SearchPlaylist) }
     items.each { |item| item.author = "" }
   else
     sort_options = {"newest", "oldest", "popular"}
@@ -3101,8 +3114,7 @@ get "/channel/:ucid/playlists" do |env|
   end
 
   items, continuation = fetch_channel_playlists(channel.ucid, channel.author, channel.auto_generated, continuation, sort_by)
-  items.select! { |item| item.is_a?(SearchPlaylist) && !item.videos.empty? }
-  items = items.map { |item| item.as(SearchPlaylist) }
+  items = items.select { |item| item.is_a?(SearchPlaylist) }.map { |item| item.as(SearchPlaylist) }
   items.each { |item| item.author = "" }
 
   env.set "search", "channel:#{channel.ucid} "
@@ -4096,8 +4108,10 @@ get "/api/v1/playlists/:plid" do |env|
 
   response = JSON.build do |json|
     json.object do
+      json.field "type", "playlist"
       json.field "title", playlist.title
       json.field "playlistId", playlist.id
+      json.field "playlistThumbnail", playlist.thumbnail
 
       json.field "author", playlist.author
       json.field "authorId", playlist.ucid
@@ -5129,6 +5143,43 @@ get "/sb/:id/:storyboard/:index" do |env|
   end
 end
 
+get "/s_p/:id/:name" do |env|
+  id = env.params.url["id"]
+  name = env.params.url["name"]
+
+  host = "https://i9.ytimg.com"
+  client = make_client(URI.parse(host))
+  url = env.request.resource
+
+  headers = HTTP::Headers.new
+  REQUEST_HEADERS_WHITELIST.each do |header|
+    if env.request.headers[header]?
+      headers[header] = env.request.headers[header]
+    end
+  end
+
+  begin
+    client.get(url, headers) do |response|
+      env.response.status_code = response.status_code
+      response.headers.each do |key, value|
+        if !RESPONSE_HEADERS_BLACKLIST.includes? key
+          env.response.headers[key] = value
+        end
+      end
+
+      env.response.headers["Access-Control-Allow-Origin"] = "*"
+
+      if response.status_code >= 300 && response.status_code != 404
+        env.response.headers.delete("Transfer-Encoding")
+        break
+      end
+
+      proxy_file(response, env)
+    end
+  rescue ex
+  end
+end
+
 get "/vi/:id/:name" do |env|
   id = env.params.url["id"]
   name = env.params.url["name"]
@@ -5175,7 +5226,7 @@ get "/vi/:id/:name" do |env|
   end
 end
 
-# Undocumented, creates anonymous playlist with specified 'video_ids'
+# Undocumented, creates anonymous playlist with specified 'video_ids', max 50 videos
 get "/watch_videos" do |env|
   client = make_client(YT_URL)
 
