@@ -154,26 +154,32 @@ statistics = {
 }
 if config.statistics_enabled
   spawn do
-    loop do
-      statistics = {
-        "version"           => "2.0",
-        "software"          => SOFTWARE,
-        "openRegistrations" => config.registration_enabled,
-        "usage"             => {
-          "users" => {
-            "total"          => PG_DB.query_one("SELECT count(*) FROM users", as: Int64),
-            "activeHalfyear" => PG_DB.query_one("SELECT count(*) FROM users WHERE CURRENT_TIMESTAMP - updated < '6 months'", as: Int64),
-            "activeMonth"    => PG_DB.query_one("SELECT count(*) FROM users WHERE CURRENT_TIMESTAMP - updated < '1 month'", as: Int64),
-          },
+    statistics = {
+      "version"           => "2.0",
+      "software"          => SOFTWARE,
+      "openRegistrations" => config.registration_enabled,
+      "usage"             => {
+        "users" => {
+          "total"          => PG_DB.query_one("SELECT count(*) FROM users", as: Int64),
+          "activeHalfyear" => PG_DB.query_one("SELECT count(*) FROM users WHERE CURRENT_TIMESTAMP - updated < '6 months'", as: Int64),
+          "activeMonth"    => PG_DB.query_one("SELECT count(*) FROM users WHERE CURRENT_TIMESTAMP - updated < '1 month'", as: Int64),
         },
-        "metadata" => {
-          "updatedAt"              => Time.utc.to_unix,
-          "lastChannelRefreshedAt" => PG_DB.query_one?("SELECT updated FROM channels ORDER BY updated DESC LIMIT 1", as: Time).try &.to_unix || 0,
-        },
-      }
+      },
+      "metadata" => {
+        "updatedAt"              => Time.utc.to_unix,
+        "lastChannelRefreshedAt" => PG_DB.query_one?("SELECT updated FROM channels ORDER BY updated DESC LIMIT 1", as: Time).try &.to_unix || 0_i64,
+      },
+    }
 
+    loop do
       sleep 1.minute
       Fiber.yield
+
+      statistics["usage"].as(Hash)["users"].as(Hash)["total"] = PG_DB.query_one("SELECT count(*) FROM users", as: Int64)
+      statistics["usage"].as(Hash)["users"].as(Hash)["activeHalfyear"] = PG_DB.query_one("SELECT count(*) FROM users WHERE CURRENT_TIMESTAMP - updated < '6 months'", as: Int64)
+      statistics["usage"].as(Hash)["users"].as(Hash)["activeMonth"] = PG_DB.query_one("SELECT count(*) FROM users WHERE CURRENT_TIMESTAMP - updated < '1 month'", as: Int64)
+      statistics["metadata"].as(Hash(String, Int64))["updatedAt"] = Time.utc.to_unix
+      statistics["metadata"].as(Hash(String, Int64))["lastChannelRefreshedAt"] = PG_DB.query_one?("SELECT updated FROM channels ORDER BY updated DESC LIMIT 1", as: Time).try &.to_unix || 0_i64
     end
   end
 end
@@ -3230,35 +3236,35 @@ get "/api/v1/storyboards/:id" do |env|
     storyboard = storyboard[0]
   end
 
-  webvtt = <<-END_VTT
-  WEBVTT
+  String.build do |str|
+    str << <<-END_VTT
+    WEBVTT
 
 
-  END_VTT
+    END_VTT
 
-  start_time = 0.milliseconds
-  end_time = storyboard[:interval].milliseconds
+    start_time = 0.milliseconds
+    end_time = storyboard[:interval].milliseconds
 
-  storyboard[:storyboard_count].times do |i|
-    host_url = make_host_url(config, Kemal.config)
-    url = storyboard[:url].gsub("$M", i).gsub("https://i9.ytimg.com", host_url)
+    storyboard[:storyboard_count].times do |i|
+      host_url = make_host_url(config, Kemal.config)
+      url = storyboard[:url].gsub("$M", i).gsub("https://i9.ytimg.com", host_url)
 
-    storyboard[:storyboard_height].times do |j|
-      storyboard[:storyboard_width].times do |k|
-        webvtt += <<-END_CUE
-        #{start_time}.000 --> #{end_time}.000
-        #{url}#xywh=#{storyboard[:width] * k},#{storyboard[:height] * j},#{storyboard[:width]},#{storyboard[:height]}
+      storyboard[:storyboard_height].times do |j|
+        storyboard[:storyboard_width].times do |k|
+          str << <<-END_CUE
+          #{start_time}.000 --> #{end_time}.000
+          #{url}#xywh=#{storyboard[:width] * k},#{storyboard[:height] * j},#{storyboard[:width]},#{storyboard[:height]}
 
 
-        END_CUE
+          END_CUE
 
-        start_time += storyboard[:interval].milliseconds
-        end_time += storyboard[:interval].milliseconds
+          start_time += storyboard[:interval].milliseconds
+          end_time += storyboard[:interval].milliseconds
+        end
       end
     end
   end
-
-  webvtt
 end
 
 get "/api/v1/captions/:id" do |env|
@@ -3328,7 +3334,7 @@ get "/api/v1/captions/:id" do |env|
     caption = caption[0]
   end
 
-  url = caption.baseUrl + "&tlang=#{tlang}"
+  url = "#{caption.baseUrl}&tlang=#{tlang}"
 
   # Auto-generated captions often have cues that aren't aligned properly with the video,
   # as well as some other markup that makes it cumbersome, so we try to fix that here
@@ -3336,46 +3342,47 @@ get "/api/v1/captions/:id" do |env|
     caption_xml = client.get(url).body
     caption_xml = XML.parse(caption_xml)
 
-    webvtt = <<-END_VTT
-    WEBVTT
-    Kind: captions
-    Language: #{tlang || caption.languageCode}
+    webvtt = String.build do |str|
+      str << <<-END_VTT
+      WEBVTT
+      Kind: captions
+      Language: #{tlang || caption.languageCode}
 
 
-    END_VTT
+      END_VTT
 
-    caption_nodes = caption_xml.xpath_nodes("//transcript/text")
-    caption_nodes.each_with_index do |node, i|
-      start_time = node["start"].to_f.seconds
-      duration = node["dur"]?.try &.to_f.seconds
-      duration ||= start_time
+      caption_nodes = caption_xml.xpath_nodes("//transcript/text")
+      caption_nodes.each_with_index do |node, i|
+        start_time = node["start"].to_f.seconds
+        duration = node["dur"]?.try &.to_f.seconds
+        duration ||= start_time
 
-      if caption_nodes.size > i + 1
-        end_time = caption_nodes[i + 1]["start"].to_f.seconds
-      else
-        end_time = start_time + duration
+        if caption_nodes.size > i + 1
+          end_time = caption_nodes[i + 1]["start"].to_f.seconds
+        else
+          end_time = start_time + duration
+        end
+
+        start_time = "#{start_time.hours.to_s.rjust(2, '0')}:#{start_time.minutes.to_s.rjust(2, '0')}:#{start_time.seconds.to_s.rjust(2, '0')}.#{start_time.milliseconds.to_s.rjust(3, '0')}"
+        end_time = "#{end_time.hours.to_s.rjust(2, '0')}:#{end_time.minutes.to_s.rjust(2, '0')}:#{end_time.seconds.to_s.rjust(2, '0')}.#{end_time.milliseconds.to_s.rjust(3, '0')}"
+
+        text = HTML.unescape(node.content)
+        text = text.gsub(/<font color="#[a-fA-F0-9]{6}">/, "")
+        text = text.gsub(/<\/font>/, "")
+        if md = text.match(/(?<name>.*) : (?<text>.*)/)
+          text = "<v #{md["name"]}>#{md["text"]}</v>"
+        end
+
+        str << <<-END_CUE
+        #{start_time} --> #{end_time}
+        #{text}
+
+
+        END_CUE
       end
-
-      start_time = "#{start_time.hours.to_s.rjust(2, '0')}:#{start_time.minutes.to_s.rjust(2, '0')}:#{start_time.seconds.to_s.rjust(2, '0')}.#{start_time.milliseconds.to_s.rjust(3, '0')}"
-      end_time = "#{end_time.hours.to_s.rjust(2, '0')}:#{end_time.minutes.to_s.rjust(2, '0')}:#{end_time.seconds.to_s.rjust(2, '0')}.#{end_time.milliseconds.to_s.rjust(3, '0')}"
-
-      text = HTML.unescape(node.content)
-      text = text.gsub(/<font color="#[a-fA-F0-9]{6}">/, "")
-      text = text.gsub(/<\/font>/, "")
-      if md = text.match(/(?<name>.*) : (?<text>.*)/)
-        text = "<v #{md["name"]}>#{md["text"]}</v>"
-      end
-
-      webvtt += <<-END_CUE
-    #{start_time} --> #{end_time}
-    #{text}
-
-
-    END_CUE
     end
   else
-    url += "&format=vtt"
-    webvtt = client.get(url).body
+    webvtt = client.get("#{url}&format=vtt").body
   end
 
   if title = env.params.query["title"]?
@@ -4911,12 +4918,24 @@ get "/videoplayback" do |env|
     end
   end
 
+  client = make_client(URI.parse(host), region)
+
   response = HTTP::Client::Response.new(403)
   5.times do
     begin
-      client = make_client(URI.parse(host), region)
       response = client.head(url, headers)
-      break
+
+      if response.headers["Location"]?
+        location = URI.parse(response.headers["Location"])
+        env.response.headers["Access-Control-Allow-Origin"] = "*"
+
+        host = "#{location.scheme}://#{location.host}"
+        client = make_client(URI.parse(host), region)
+
+        url = "#{location.full_path}&host=#{location.host}#{region ? "&region=#{region}" : ""}"
+      else
+        break
+      end
     rescue Socket::Addrinfo::Error
       if !mns.empty?
         mn = mns.pop
@@ -4924,23 +4943,10 @@ get "/videoplayback" do |env|
       fvip = "3"
 
       host = "https://r#{fvip}---#{mn}.googlevideo.com"
+      client = make_client(URI.parse(host), region)
     rescue ex
+      pp ex
     end
-  end
-
-  if response.headers["Location"]?
-    url = URI.parse(response.headers["Location"])
-    host = url.host
-    env.response.headers["Access-Control-Allow-Origin"] = "*"
-
-    url = url.full_path
-    url += "&host=#{host}"
-
-    if region
-      url += "&region=#{region}"
-    end
-
-    next env.redirect url
   end
 
   if response.status_code >= 400
@@ -4999,6 +5005,8 @@ get "/videoplayback" do |env|
       chunk_end = chunk_start + HTTP_CHUNK_SIZE - 1
     end
 
+    client = make_client(URI.parse(host), region)
+
     # TODO: Record bytes written so we can restart after a chunk fails
     while true
       if !range_end && content_length
@@ -5016,7 +5024,6 @@ get "/videoplayback" do |env|
       headers["Range"] = "bytes=#{chunk_start}-#{chunk_end}"
 
       begin
-        client = make_client(URI.parse(host), region)
         client.get(url, headers) do |response|
           if first_chunk
             if !env.request.headers["Range"]? && response.status_code == 206
@@ -5035,11 +5042,7 @@ get "/videoplayback" do |env|
 
             if location = response.headers["Location"]?
               location = URI.parse(location)
-              location = "#{location.full_path}&host=#{location.host}"
-
-              if region
-                location += "&region=#{region}"
-              end
+              location = "#{location.full_path}&host=#{location.host}#{region ? "&region=#{region}" : ""}"
 
               env.redirect location
               break
@@ -5066,6 +5069,8 @@ get "/videoplayback" do |env|
       rescue ex
         if ex.message != "Error reading socket: Connection reset by peer"
           break
+        else
+          client = make_client(URI.parse(host), region)
         end
       end
 
