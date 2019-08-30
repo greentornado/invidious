@@ -866,6 +866,11 @@ end
 class VideoRedirect < Exception
 end
 
+def get_video_without_pg(id, region = nil)
+  video = fetch_video(id, region)
+  return video
+end
+
 def get_video(id, db, refresh = true, region = nil, force_refresh = false)
   if (video = db.query_one?("SELECT * FROM videos WHERE id = $1", id, as: Video)) && !region
     # If record was last updated over 10 minutes ago, or video has since premiered,

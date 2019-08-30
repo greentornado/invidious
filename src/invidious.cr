@@ -3609,6 +3609,27 @@ get "/api/v1/annotations/:id" do |env|
   annotations
 end
 
+get "/api/v2/videos/:id" do |env|
+  locale = LOCALES[env.get("preferences").as(Preferences).locale]?
+
+  env.response.content_type = "application/json"
+
+  id = env.params.url["id"]
+  region = env.params.query["region"]?
+
+  begin
+    video = get_video_without_pg(id, region: region)
+  rescue ex : VideoRedirect
+    next env.redirect "/api/v1/videos/#{ex.message}"
+  rescue ex
+    error_message = {"error" => ex.message}.to_json
+    env.response.status_code = 500
+    next error_message
+  end
+
+  video.to_json(locale, config, Kemal.config, decrypt_function)
+end
+
 get "/api/v1/videos/:id" do |env|
   locale = LOCALES[env.get("preferences").as(Preferences).locale]?
 
