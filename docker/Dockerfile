@@ -1,6 +1,7 @@
 FROM alpine:edge AS builder
 RUN apk add -u crystal shards libc-dev \
-    yaml-dev libxml2-dev sqlite-dev sqlite-static zlib-dev openssl-dev
+    yaml-dev libxml2-dev sqlite-dev zlib-dev openssl-dev \
+    sqlite-static zlib-static openssl-libs-static
 WORKDIR /invidious
 COPY ./shard.yml ./shard.yml
 RUN shards update && shards install
@@ -18,9 +19,7 @@ RUN apk add -u imagemagick ttf-opensans
 WORKDIR /invidious
 RUN addgroup -g 1000 -S invidious && \
     adduser -u 1000 -S invidious -G invidious
-COPY ./assets/ ./assets/
 COPY ./config/config.yml ./config/config.yml
-COPY ./config/sql/ ./config/sql/
 COPY ./locales/ ./locales/
 RUN sed -i 's/host: localhost/host: postgres/' config/config.yml
 COPY --from=builder /invidious/invidious .
