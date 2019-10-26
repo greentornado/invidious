@@ -1,3 +1,46 @@
+require "pool/connection"
+
+struct HTTPPool
+  property! url : URI
+  property! capacity : Int32
+  property! timeout : Float64
+  property pool : ConnectionPool(HTTPClient)
+
+  def initialize(url : URI, @capacity = 5, @timeout = 5.0)
+    @url = url
+    @pool = build_pool
+  end
+
+  def client(region = nil, &block)
+    pool.connection do |conn|
+      if region
+        PROXY_LIST[region]?.try &.sample(40).each do |proxy|
+          begin
+            proxy = HTTPProxy.new(proxy_host: proxy[:ip], proxy_port: proxy[:port])
+            conn.set_proxy(proxy)
+            break
+          rescue ex
+          end
+        end
+      end
+
+      response = yield conn
+      conn.unset_proxy
+      response
+    end
+  end
+
+  private def build_pool
+    ConnectionPool(HTTPClient).new(capacity: capacity, timeout: timeout) do
+      client = HTTPClient.new(url)
+      client.family = (url.host == "www.youtube.com") ? CONFIG.force_resolve : Socket::Family::UNSPEC
+      client.read_timeout = 5.seconds
+      client.connect_timeout = 5.seconds
+      client
+    end
+  end
+end
+
 # See http://www.evanmiller.org/how-not-to-sort-by-average-rating.html
 def ci_lower_bound(pos, n)
   if n == 0
@@ -20,9 +63,9 @@ end
 
 def make_client(url : URI, region = nil)
   client = HTTPClient.new(url)
-  client.family = CONFIG.force_resolve
-  client.read_timeout = 15.seconds
-  client.connect_timeout = 15.seconds
+  client.family = (url.host == "www.youtube.com") ? CONFIG.force_resolve : Socket::Family::UNSPEC
+  client.read_timeout = 5.seconds
+  client.connect_timeout = 5.seconds
 
   if region
     PROXY_LIST[region]?.try &.sample(40).each do |proxy|
@@ -157,7 +200,7 @@ def number_with_separator(number)
   number.to_s.reverse.gsub(/(\d{3})(?=\d)/, "\\1,").reverse
 end
 
-def short_text_to_number(short_text)
+def short_text_to_number(short_text : String) : Int32
   case short_text
   when .ends_with? "M"
     number = short_text.rstrip(" mM").to_f
@@ -246,7 +289,7 @@ def get_referer(env, fallback = "/", unroll = true)
       if referer.query
         params = HTTP::Params.parse(referer.query.not_nil!)
         if params["referer"]?
-          referer = URI.parse(URI.unescape(params["referer"]))
+          referer = URI.parse(URI.decode_www_form(params["referer"]))
         else
           break
         end
@@ -267,8 +310,8 @@ def get_referer(env, fallback = "/", unroll = true)
 end
 
 struct VarInt
-  def self.from_io(io : IO, format = IO::ByteFormat::BigEndian) : Int32
-    result = 0_i32
+  def self.from_io(io : IO, format = IO::ByteFormat::NetworkEndian) : Int32
+    result = 0_u32
     num_read = 0
 
     loop do
@@ -276,18 +319,19 @@ struct VarInt
       raise "Invalid VarInt" if !byte
       value = byte & 0x7f
 
-      result |= value.to_i32 << (7 * num_read)
+      result |= value.to_u32 << (7 * num_read)
       num_read += 1
 
       break if byte & 0x80 == 0
       raise "Invalid VarInt" if num_read > 5
     end
 
-    result
+    result.to_i32
   end
 
   def self.to_io(io : IO, value : Int32)
     io.write_byte 0x00 if value == 0x00
+    value = value.to_u32
 
     while value != 0
       byte = (value & 0x7f).to_u8
